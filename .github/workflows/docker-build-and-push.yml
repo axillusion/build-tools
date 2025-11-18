@@ -1,0 +1,94 @@
+name: Docker release (multi-arch)
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "Full image name, e.g., ghcr.io/org/app"
+        required: true
+        type: string
+      context:
+        description: "Build context"
+        default: "."
+        type: string
+      dockerfile:
+        description: "Path to Dockerfile"
+        default: "Dockerfile"
+        type: string
+      platforms:
+        description: "Target platforms"
+        default: "linux/amd64,linux/arm64"
+        type: string
+      version:
+        description: "Version tag (omit to derive from the Git tag)"
+        required: false
+        type: string
+      add_latest:
+        description: "Also push :latest"
+        default: true
+        type: boolean
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: v
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            V="${{ inputs.version }}"
+          else
+            if [ "${{ github.ref_type }}" = "tag" ]; then
+              # Accept tags like v1.2.3 or 1.2.3; strip leading 'v' if present
+              V="${{ github.ref_name }}"
+              V="${V#v}"
+            else
+              echo "No inputs.version provided and not a tag run; pass inputs.version or trigger on a tag (vX.Y.Z)."
+              exit 1
+            fi
+          fi
+          echo "version=$V" >> $GITHUB_OUTPUT
+          echo "Resolved version: $V"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push (multi-arch)
+        env:
+          IMAGE: ${{ inputs.image }}
+          VERSION: ${{ steps.v.outputs.version }}
+          CONTEXT: ${{ inputs.context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          PLATFORMS: ${{ inputs.platforms }}
+          ADD_LATEST: ${{ inputs.add_latest }}
+        shell: bash
+        run: |
+          TAGS="-t ${IMAGE}:${VERSION}"
+          if [ "${ADD_LATEST}" = "true" ]; then
+            TAGS="$TAGS -t ${IMAGE}:latest"
+          fi
+
+          docker buildx build \
+            --platform "${PLATFORMS}" \
+            ${TAGS} \
+            -f "${DOCKERFILE}" \
+            "${CONTEXT}" \
+            --push
