@@ -74,8 +74,8 @@ jobs:
       - name: Create temporary Maven settings.xml (for BuildKit)
         shell: bash
         env:
-          GH_ACTOR: ${{ github.actor }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_ACTOR: ${{ secrets.MVN_USERNAME }}
+          GH_TOKEN: ${{ secrets.MVN_PASSWORD }}
         run: |
           cat > settings.xml << EOF
           <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
