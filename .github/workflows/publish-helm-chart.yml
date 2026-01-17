@@ -1,0 +1,83 @@
+name: Publish Helm chart to GHCR
+
+on:
+  workflow_call:
+    inputs:
+      chart_dir:
+        description: "Path to Helm chart folder (must contain Chart.yaml)"
+        required: true
+        type: string
+      registry:
+        description: "OCI registry URL"
+        required: false
+        default: "ghcr.io"
+        type: string
+      repository:
+        description: "OCI repository path (no tag)"
+        required: false
+        default: "doda2025-team20/team20-helm"
+        type: string
+      helm_version:
+        description: "Helm version"
+        required: false
+        default: "v3.15.4"
+        type: string
+      lint:
+        description: "Run helm lint"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write   # REQUIRED for GHCR
+
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: ${{ inputs.helm_version }}
+
+      - name: Validate chart directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHART_DIR="${{ inputs.chart_dir }}"
+          test -d "$CHART_DIR" || { echo "chart_dir does not exist: $CHART_DIR"; exit 1; }
+          test -f "$CHART_DIR/Chart.yaml" || { echo "No Chart.yaml in $CHART_DIR"; exit 1; }
+
+      - name: Lint chart
+        if: ${{ inputs.lint }}
+        run: helm lint "${{ inputs.chart_dir }}"
+
+      - name: Login to GHCR
+        shell: bash
+        run: |
+          echo "${{ github.token }}" | helm registry login \
+            ${{ inputs.registry }} \
+            --username "${{ github.actor }}" \
+            --password-stdin
+
+      - name: Package chart
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm dependency update "${{ inputs.chart_dir }}" || true
+          helm package "${{ inputs.chart_dir }}" --destination dist
+          ls -lah dist
+
+      - name: Push chart to OCI registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHART_TGZ="$(ls dist/*.tgz)"
+          OCI_REF="oci://${{ inputs.registry }}/${{ inputs.repository }}"
+          echo "Pushing $CHART_TGZ to $OCI_REF"
+          helm push "$CHART_TGZ" "$OCI_REF"
