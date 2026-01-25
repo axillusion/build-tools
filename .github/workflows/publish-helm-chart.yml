@@ -60,7 +60,7 @@ jobs:
       - name: Login to GHCR
         shell: bash
         run: |
-          echo "${{ github.token }}" | helm registry login \
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login \
             ${{ inputs.registry }} \
             --username "${{ github.actor }}" \
             --password-stdin
