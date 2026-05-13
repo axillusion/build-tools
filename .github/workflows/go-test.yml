@@ -1,0 +1,64 @@
+name: Go test
+
+on:
+  workflow_call:
+    inputs:
+      go_version:
+        description: "Go version"
+        required: false
+        default: "1.23"
+        type: string
+      working_directory:
+        description: "Working directory for tests (default: repository root)"
+        required: false
+        default: "."
+        type: string
+      test_flags:
+        description: "Flags to pass to go test (e.g., -race, -shuffle=on)"
+        required: false
+        default: "-race"
+        type: string
+      coverage_threshold:
+        description: "Minimum coverage percentage required (0 to disable)"
+        required: false
+        default: "0"
+        type: string
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+
+      - name: Run tests
+        working-directory: ${{ inputs.working_directory }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ${{ inputs.test_flags }} ./...
+
+      - name: Check coverage
+        if: ${{ inputs.coverage_threshold != '0' }}
+        working-directory: ${{ inputs.working_directory }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          THRESHOLD="${{ inputs.coverage_threshold }}"
+          COVERAGE=$(go test -coverprofile=coverage.out ./... | grep -oP 'coverage: \K[0-9.]+' || echo "0")
+          echo "Coverage: ${COVERAGE}%"
+          
+          if (( $(echo "$COVERAGE < $THRESHOLD" | bc -l) )); then
+            echo "Coverage ${COVERAGE}% is below threshold ${THRESHOLD}%"
+            exit 1
+          fi
+          echo "Coverage check passed: ${COVERAGE}% >= ${THRESHOLD}%"
