@@ -27,6 +27,11 @@ on:
         description: "Also push :latest"
         default: true
         type: boolean
+      build_secret:
+        description: "Optional BuildKit secret, e.g. id=m2,src=./settings.xml"
+        required: false
+        type: string
+        default: ""
 
 jobs:
   build:
@@ -47,11 +52,10 @@ jobs:
             V="${{ inputs.version }}"
           else
             if [ "${{ github.ref_type }}" = "tag" ]; then
-              # Accept tags like v1.2.3 or 1.2.3; strip leading 'v' if present
               V="${{ github.ref_name }}"
               V="${V#v}"
             else
-              echo "No inputs.version provided and not a tag run; pass inputs.version or trigger on a tag (vX.Y.Z)."
+              echo "No inputs.version provided and not a tag run; pass inputs.version or trigger on a tag."
               exit 1
             fi
           fi
@@ -71,47 +75,7 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Create temporary Maven settings.xml (for BuildKit)
-        shell: bash
-        env:
-          GH_ACTOR: ${{ secrets.MVN_USERNAME }}
-          GH_TOKEN: ${{ secrets.MVN_PASSWORD }}
-        run: |
-          cat > settings.xml << EOF
-          <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
-                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                    xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0
-                                        https://maven.apache.org/xsd/settings-1.0.0.xsd">
-
-            <activeProfiles>
-              <activeProfile>github</activeProfile>
-            </activeProfiles>
-
-            <profiles>
-              <profile>
-                <id>github</id>
-                <repositories>
-                  <repository>
-                    <id>github</id>
-                    <url>https://maven.pkg.github.com/doda2025-team20/lib-version</url>
-                    <snapshots><enabled>true</enabled></snapshots>
-                  </repository>
-                </repositories>
-              </profile>
-            </profiles>
-
-            <servers>
-              <server>
-                <id>github</id>
-                <username>$GH_ACTOR</username>
-                <password>$GH_TOKEN</password>
-              </server>
-            </servers>
-          </settings>
-          EOF
-          chmod 600 settings.xml
-
-      - name: Build and push (multi-arch)
+      - name: Build and push
         env:
           IMAGE: ${{ inputs.image }}
           VERSION: ${{ steps.v.outputs.version }}
@@ -119,6 +83,7 @@ jobs:
           DOCKERFILE: ${{ inputs.dockerfile }}
           PLATFORMS: ${{ inputs.platforms }}
           ADD_LATEST: ${{ inputs.add_latest }}
+          BUILD_SECRET: ${{ inputs.build_secret }}
         shell: bash
         run: |
           TAGS="-t ${IMAGE}:${VERSION}"
@@ -126,10 +91,15 @@ jobs:
             TAGS="$TAGS -t ${IMAGE}:latest"
           fi
 
+          SECRET_ARG=""
+          if [ -n "${BUILD_SECRET}" ]; then
+            SECRET_ARG="--secret ${BUILD_SECRET}"
+          fi
+
           docker buildx build \
             --platform "${PLATFORMS}" \
             ${TAGS} \
             -f "${DOCKERFILE}" \
+            ${SECRET_ARG} \
             "${CONTEXT}" \
-            --secret id=m2,src=./settings.xml \
             --push
