@@ -29,6 +29,8 @@ jobs:
       dockerfile: "Dockerfile"
       platforms: "linux/amd64,linux/arm64"
       add_latest: true
+    secrets:
+      registry_token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
 **Inputs:**
@@ -42,12 +44,26 @@ jobs:
 | `version` | Version tag (omit to derive from Git tag) | No | — |
 | `add_latest` | Also push `:latest` tag | No | `true` |
 | `build_secret` | Optional BuildKit secret (e.g., `id=m2,src=./settings.xml`) | No | — |
+| `registry_token_secret` | Name of the secret containing registry token | No | `"GITHUB_TOKEN"` |
+
+**Secrets:**
+
+| Secret | Description | Required |
+|--------|-------------|----------|
+| `registry_token` | Registry authentication token | ✅ Yes |
+
+Pass your repository's secret (e.g., `GITHUB_TOKEN`, `GIT_TOKEN`, or custom token):
+
+```yaml
+secrets:
+  registry_token: ${{ secrets.GIT_TOKEN }}
+```
 
 **Permissions Required:**
 - `contents: read` — to checkout the repository
 - `packages: write` — to push images to GHCR
 
-**Example with version:**
+**Example with custom token secret:**
 
 ```yaml
 jobs:
@@ -59,6 +75,8 @@ jobs:
     with:
       image: ghcr.io/myorg/app
       version: "1.2.3"
+    secrets:
+      registry_token: ${{ secrets.GIT_TOKEN }}
 ```
 
 ---
@@ -204,6 +222,8 @@ jobs:
       image: ghcr.io/myorg/myapp
       platforms: "linux/amd64,linux/arm64"
       add_latest: true
+    secrets:
+      registry_token: ${{ secrets.GITHUB_TOKEN }}
 
   helm:
     needs: docker

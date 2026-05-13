@@ -32,6 +32,16 @@ on:
         required: false
         type: string
         default: ""
+      registry_token_secret:
+        description: "Name of the secret containing registry token (e.g., GITHUB_TOKEN, GIT_TOKEN)"
+        required: false
+        type: string
+        default: "GIT_TOKEN"
+
+    secrets:
+      registry_token:
+        description: "Registry token for authentication"
+        required: true
 
 jobs:
   build:
@@ -67,7 +77,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.registry_token }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
