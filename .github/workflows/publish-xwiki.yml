@@ -1,0 +1,223 @@
+name: Publish Markdown to XWiki
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "Prebuilt md2xwiki container image with a tag or digest"
+        required: true
+        type: string
+      config:
+        description: "TOML configuration path relative to the caller repository"
+        default: "xwiki.toml"
+        type: string
+      output:
+        description: "Output directory relative to the caller repository"
+        default: "build/xwiki"
+        type: string
+      environment:
+        description: "Optional GitHub deployment environment in the caller repository"
+        type: string
+      login_to_ghcr:
+        description: "Authenticate to GHCR using the caller job token"
+        default: false
+        type: boolean
+      use_vpn:
+        description: "Connect using an OpenVPN profile before publishing"
+        default: false
+        type: boolean
+      overwrite:
+        description: "Back up drifted managed content and replace it"
+        default: false
+        type: boolean
+      prune:
+        description: "Remove unchanged, previously owned content omitted from the source"
+        default: false
+        type: boolean
+      artifact_name:
+        description: "Name for retained output; leave empty to skip upload"
+        type: string
+    secrets:
+      XWIKI_USERNAME:
+        description: "XWiki publisher account"
+        required: true
+      XWIKI_PASSWORD:
+        description: "XWiki publisher password"
+        required: true
+      OPENVPN_CONFIG:
+        description: "Complete inline OpenVPN profile, required when use_vpn is true"
+        required: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Require the OpenVPN profile
+        if: inputs.use_vpn
+        env:
+          OPENVPN_CONFIG: ${{ secrets.OPENVPN_CONFIG }}
+        shell: bash
+        run: |
+          if [[ -z "${OPENVPN_CONFIG//[[:space:]]/}" ]]; then
+            echo "::error::Pass the OPENVPN_CONFIG secret when use_vpn is true."
+            exit 1
+          fi
+
+      - name: Check out the caller repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate publishing inputs
+        id: paths
+        env:
+          IMAGE: ${{ inputs.image }}
+          CONFIG: ${{ inputs.config }}
+          OUTPUT: ${{ inputs.output }}
+          LOGIN_TO_GHCR: ${{ inputs.login_to_ghcr }}
+          XWIKI_USERNAME: ${{ secrets.XWIKI_USERNAME }}
+          XWIKI_PASSWORD: ${{ secrets.XWIKI_PASSWORD }}
+        shell: bash
+        run: |
+          if [[ -z "$IMAGE" || "$IMAGE" == -* || "$IMAGE" == *[[:space:]]* ]]; then
+            echo "::error::Set image to a valid md2xwiki container image reference."
+            exit 1
+          fi
+          if [[ "$LOGIN_TO_GHCR" == true && "$IMAGE" != ghcr.io/* ]]; then
+            echo "::error::login_to_ghcr requires an image from ghcr.io."
+            exit 1
+          fi
+          if [[ -z "$XWIKI_USERNAME" || -z "$XWIKI_PASSWORD" ]]; then
+            echo "::error::Pass both XWIKI_USERNAME and XWIKI_PASSWORD."
+            exit 1
+          fi
+          for path in "$CONFIG" "$OUTPUT"; do
+            case "$path" in
+              ""|/*|../*|*/../*|*/..|..|*,*|*$'\n'*|*$'\r'*)
+                echo "::error::Config and output must be repository-relative paths without traversal, commas or newlines."
+                exit 1 ;;
+            esac
+          done
+          workspace=$(realpath -- "$GITHUB_WORKSPACE")
+          config=$(realpath -m -- "$workspace/$CONFIG")
+          output=$(realpath -m -- "$workspace/$OUTPUT")
+          if [[ "$config" != "$workspace/"* || ! -f "$config" ]]; then
+            echo "::error::The TOML configuration must be a file inside the caller repository."
+            exit 1
+          fi
+          if [[ "$output" != "$workspace/"* || "$output/" == "$workspace/.git/"* ]]; then
+            echo "::error::Output must be a subdirectory of the caller workspace outside .git."
+            exit 1
+          fi
+          if [[ "$config$output" == *,* || "$config$output" == *$'\n'* || "$config$output" == *$'\r'* ]]; then
+            echo "::error::Resolved config and output paths cannot contain commas or newlines."
+            exit 1
+          fi
+          mkdir -p -- "$output"
+          {
+            printf 'workspace=%s\n' "$workspace"
+            printf 'config=%s\n' "${config#"$workspace/"}"
+            printf 'output=%s\n' "$output"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: inputs.login_to_ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Pull the publisher image
+        env:
+          IMAGE: ${{ inputs.image }}
+        shell: bash
+        run: docker pull "$IMAGE"
+
+      - name: Connect to OpenVPN
+        if: inputs.use_vpn
+        env:
+          OPENVPN_CONFIG: ${{ secrets.OPENVPN_CONFIG }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes openvpn openvpn-systemd-resolved
+
+          umask 077
+          vpn_dir=$(mktemp -d "$RUNNER_TEMP/xwiki-openvpn.XXXXXXXX")
+          printf 'VPN_DIR=%s\n' "$vpn_dir" >> "$GITHUB_ENV"
+          printf '%s\n' "$OPENVPN_CONFIG" > "$vpn_dir/client.ovpn"
+          sudo openvpn --config "$vpn_dir/client.ovpn" \
+            --auth-nocache --auth-retry nointeract \
+            --script-security 2 \
+            --up /etc/openvpn/update-systemd-resolved --up-restart \
+            --down /etc/openvpn/update-systemd-resolved --down-pre \
+            --dhcp-option DOMAIN-ROUTE . \
+            --daemon xwiki-openvpn --writepid "$vpn_dir/openvpn.pid" \
+            --log "$vpn_dir/openvpn.log" --verb 3
+
+          for attempt in {1..60}; do
+            if sudo grep -q 'Initialization Sequence Completed' "$vpn_dir/openvpn.log"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::OpenVPN did not connect within 120 seconds. Check or renew OPENVPN_CONFIG."
+          exit 1
+
+      - name: Publish and verify XWiki content
+        env:
+          IMAGE: ${{ inputs.image }}
+          WORKSPACE: ${{ steps.paths.outputs.workspace }}
+          CONFIG: ${{ steps.paths.outputs.config }}
+          OUTPUT: ${{ steps.paths.outputs.output }}
+          USE_VPN: ${{ inputs.use_vpn }}
+          OVERWRITE: ${{ inputs.overwrite }}
+          PRUNE: ${{ inputs.prune }}
+          XWIKI_USERNAME: ${{ secrets.XWIKI_USERNAME }}
+          XWIKI_PASSWORD: ${{ secrets.XWIKI_PASSWORD }}
+          XWIKI_EXPECTED_USER: ${{ vars.XWIKI_EXPECTED_USER }}
+        shell: bash
+        run: |
+          network_args=()
+          args=()
+          if [[ "$USE_VPN" == true ]]; then
+            network_args=(--network host --dns 127.0.0.53)
+          fi
+          if [[ "$OVERWRITE" == true ]]; then args+=(--overwrite); fi
+          if [[ "$PRUNE" == true ]]; then args+=(--prune); fi
+          docker run --rm --pull never --user "$(id -u):$(id -g)" \
+            "${network_args[@]}" \
+            --mount "type=bind,source=$WORKSPACE,target=/workspace,readonly" \
+            --mount "type=bind,source=$OUTPUT,target=/output" \
+            --env XWIKI_USERNAME --env XWIKI_PASSWORD --env XWIKI_EXPECTED_USER \
+            "$IMAGE" pipeline --config "/workspace/$CONFIG" --output /output "${args[@]}"
+
+      - name: Disconnect OpenVPN and remove the profile
+        if: always() && inputs.use_vpn && env.VPN_DIR != ''
+        shell: bash
+        run: |
+          if [[ -f "$VPN_DIR/openvpn.pid" ]]; then
+            sudo kill -TERM "$(sudo cat "$VPN_DIR/openvpn.pid")" || true
+            for attempt in {1..20}; do
+              [[ -f "$VPN_DIR/openvpn.pid" ]] || break
+              sleep 1
+            done
+          fi
+          sudo rm -f -- "$VPN_DIR/client.ovpn" "$VPN_DIR/openvpn.pid" "$VPN_DIR/openvpn.log"
+          rmdir -- "$VPN_DIR"
+
+      - name: Retain compilation, backups and deployment summaries
+        if: always() && inputs.artifact_name != '' && steps.paths.outputs.output != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ steps.paths.outputs.output }}
+          if-no-files-found: ignore
+          retention-days: 14

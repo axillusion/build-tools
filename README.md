@@ -190,6 +190,63 @@ jobs:
 
 ---
 
+### Publish Markdown to XWiki (`publish-xwiki.yml`)
+
+Publishes the caller's Markdown using a prebuilt `md2xwiki` image. The
+publisher compiles the Markdown, checks the deployment plan, uploads changes,
+and verifies the result. Use a versioned image or digest.
+
+```yaml
+jobs:
+  publish:
+    uses: axillusion/build-tools/.github/workflows/publish-xwiki.yml@main
+    permissions:
+      contents: read
+      packages: read
+    with:
+      image: ghcr.io/example/md2xwiki:0.1.0
+      config: xwiki.toml
+      environment: xwiki
+      artifact_name: xwiki-${{ github.run_id }}-${{ github.run_attempt }}
+    secrets:
+      XWIKI_USERNAME: ${{ secrets.XWIKI_USERNAME }}
+      XWIKI_PASSWORD: ${{ secrets.XWIKI_PASSWORD }}
+```
+
+| Input | Description | Default |
+| --- | --- | --- |
+| `image` | Prebuilt `md2xwiki` image with a tag or digest | Required |
+| `config` | Repository-relative TOML file selecting source pages and wiki destinations | `xwiki.toml` |
+| `output` | Repository-relative output directory | `build/xwiki` |
+| `environment` | Deployment environment in the caller repository | Empty |
+| `login_to_ghcr` | Authenticate to GHCR with the caller's job token | `false` |
+| `use_vpn` | Connect to OpenVPN after pulling the image | `false` |
+| `overwrite` | Back up and replace drifted managed content | `false` |
+| `prune` | Delete unchanged, previously owned resources omitted from source | `false` |
+| `artifact_name` | Upload compilation, backups, and summaries under this artifact name | Empty |
+
+Pass `XWIKI_USERNAME` and `XWIKI_PASSWORD` as secrets. If the deployment
+environment holds them, use the same secret names and pass them explicitly as
+shown. Set `XWIKI_EXPECTED_USER` as a repository or environment variable when
+the authenticated XWiki reference differs from the username.
+
+To use OpenVPN, add `use_vpn: true` under `with` and
+`OPENVPN_CONFIG: ${{ secrets.OPENVPN_CONFIG }}` under `secrets`. Keep the
+complete non-interactive profile, including any inline keys and certificates,
+in that secret. The job fails if the profile is blank, and it disconnects and
+removes the profile after publishing. A run with `use_vpn: false` requires no
+profile.
+
+The workflow uses `contents: read` to check out the caller's files and
+`packages: read` for optional GHCR authentication. For a private package,
+enable `login_to_ghcr` and give the caller repository read access to that
+package. The workflow exposes no job outputs. If requested, its artifact
+contains the compiled content, deployment summaries, and any wiki backups.
+Choose a distinct artifact name for each call in the same workflow run, and
+restrict access to runs whose artifacts contain private wiki content.
+
+---
+
 ## Complete Example Workflow
 
 Here's a complete example that uses all three workflows in a single caller workflow:
