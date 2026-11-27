@@ -1,0 +1,371 @@
+name: Semantic release
+
+on:
+  workflow_call:
+    inputs:
+      github_release:
+        description: "Publish a GitHub Release with grouped notes"
+        type: boolean
+        default: true
+      initial_validation_base:
+        description: "Full commit SHA to exclude with its ancestors from validation before the first version tag"
+        type: string
+      image:
+        description: "Full GHCR image name, e.g. ghcr.io/org/app. Omit to skip Docker publishing."
+        type: string
+      context:
+        description: "Docker build context"
+        type: string
+        default: "."
+      dockerfile:
+        description: "Path to the Dockerfile"
+        type: string
+        default: "Dockerfile"
+      platforms:
+        description: "Target container platforms"
+        type: string
+        default: "linux/amd64,linux/arm64"
+      add_latest:
+        description: "Also push the latest container tag"
+        type: boolean
+        default: true
+      build_secret:
+        description: "Optional BuildKit secret argument"
+        type: string
+      helm_chart_dir:
+        description: "Path to a Helm chart. Omit to skip Helm publishing."
+        type: string
+      helm_registry:
+        description: "Helm OCI registry hostname"
+        type: string
+        default: "ghcr.io"
+      helm_repository:
+        description: "Helm OCI namespace, e.g. org/charts"
+        type: string
+      helm_registry_username:
+        description: "Helm registry login username"
+        type: string
+    secrets:
+      docker_registry_token:
+        description: "GHCR credential for the Docker image. Defaults to GITHUB_TOKEN."
+        required: false
+      helm_registry_token:
+        description: "Helm OCI registry credential. Defaults to GITHUB_TOKEN for GHCR."
+        required: false
+    outputs:
+      version:
+        description: "Published semantic version, e.g. 1.2.3"
+        value: ${{ jobs.publish.outputs.version }}
+      tag:
+        description: "Published Git tag, e.g. v1.2.3"
+        value: ${{ jobs.publish.outputs.tag }}
+
+concurrency:
+  group: build-tools-semantic-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  conventional-commits:
+    name: Conventional Commits
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' && !github.event.deleted &&
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Git history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          sparse-checkout: /.gitignore
+          sparse-checkout-cone-mode: false
+
+      - name: Validate conventional commit messages
+        shell: bash
+        env:
+          INITIAL_VALIDATION_BASE: ${{ inputs.initial_validation_base }}
+        run: |
+          node --input-type=module <<'JS'
+          import { execFileSync } from 'node:child_process';
+          import { readFileSync } from 'node:fs';
+
+          const git = (...args) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+          const types = ['build', 'chore', 'ci', 'docs', 'feat', 'fix', 'perf', 'refactor', 'revert', 'style', 'test'];
+          const header = new RegExp(String.raw`^(?:${types.join('|')})(?:\([^()\r\n]+\))?!?: \S.*$`);
+          const invalid = [];
+          let revision = process.env.GITHUB_SHA;
+
+          if (process.env.GITHUB_EVENT_NAME === 'pull_request') {
+            const { pull_request: pr } = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+            if (!header.test(pr.title)) invalid.push('Pull request title');
+            revision = `${pr.base.sha}..${pr.head.sha}`;
+          } else {
+            const tags = git('tag', '--merged', revision, '--sort=-version:refname', '--list', 'v*');
+            const stableTag = /^v(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2}$/;
+            const previous = tags.split('\n').find(tag => stableTag.test(tag));
+            const initialBase = process.env.INITIAL_VALIDATION_BASE;
+            if (previous) {
+              revision = `refs/tags/${previous}..${revision}`;
+            } else if (initialBase) {
+              if (!/^[a-f0-9]{40}$/i.test(initialBase)) {
+                throw new Error('initial_validation_base must be a full commit SHA.');
+              }
+              try {
+                git('merge-base', '--is-ancestor', initialBase, revision);
+              } catch (error) {
+                throw new Error('initial_validation_base must be an ancestor of the release commit.', { cause: error });
+              }
+              revision = `${initialBase}..${revision}`;
+            }
+          }
+
+          const fields = git('log', '--encoding=UTF-8', '--no-merges', '-z',
+            '--format=%H%x00%B', revision, '--').split('\0');
+          for (let index = 0; index < fields.length - 1; index += 2) {
+            const commit = fields[index];
+            const [subject, secondLine] = fields[index + 1].split(/\r?\n/, 2);
+            if (!header.test(subject) || secondLine?.trim()) invalid.push(`Commit ${commit.slice(0, 12)}`);
+          }
+
+          for (const item of invalid) {
+            console.error(`::error::${item} must use 'type(scope)!: description' with optional scope and !. ` +
+              `Allowed types are ${types.join(', ')}. ` +
+              'Separate the header from any body or footers with a blank line.');
+          }
+          if (invalid.length) process.exitCode = 1;
+          JS
+
+  plan:
+    name: Plan semantic release
+    needs: conventional-commits
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      notes: ${{ steps.plan.outputs.notes }}
+      run_attempt: ${{ github.run_attempt }}
+    steps:
+      - name: Validate release targets
+        shell: bash
+        env:
+          PUBLISH_GITHUB_RELEASE: ${{ inputs.github_release }}
+          IMAGE: ${{ inputs.image }}
+          HELM_CHART_DIR: ${{ inputs.helm_chart_dir }}
+          HELM_REGISTRY: ${{ inputs.helm_registry }}
+          HELM_REPOSITORY: ${{ inputs.helm_repository }}
+          HELM_REGISTRY_USERNAME: ${{ inputs.helm_registry_username }}
+          HELM_HAS_TOKEN: ${{ secrets.helm_registry_token != '' }}
+        run: |
+          if [[ -n "$HELM_CHART_DIR" && -z "$HELM_REPOSITORY" || -z "$HELM_CHART_DIR" && -n "$HELM_REPOSITORY" ]]; then
+            echo '::error::Set both helm_chart_dir and helm_repository to publish a Helm chart.'
+            exit 1
+          fi
+          if [[ "$PUBLISH_GITHUB_RELEASE" != true && -z "$IMAGE" && -z "$HELM_CHART_DIR" ]]; then
+            echo '::error::Enable github_release or configure a Docker or Helm destination.'
+            exit 1
+          fi
+          if [[ -n "$IMAGE" && ( "$IMAGE" != ghcr.io/?*/?* || "$IMAGE" == *[:@]* ) ]]; then
+            echo '::error::Set image to an untagged GHCR destination, for example ghcr.io/org/app.'
+            exit 1
+          fi
+          if [[ -n "$HELM_CHART_DIR" && -z "$HELM_REGISTRY" ]]; then
+            echo '::error::Set helm_registry to the OCI registry hostname.'
+            exit 1
+          fi
+          if [[ -n "$HELM_CHART_DIR" && "$HELM_REGISTRY" != ghcr.io && ( -z "$HELM_REGISTRY_USERNAME" || "$HELM_HAS_TOKEN" != true ) ]]; then
+            echo '::error::Set helm_registry_username and helm_registry_token for a Helm registry outside GHCR.'
+            exit 1
+          fi
+
+      - name: Checkout Git history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          sparse-checkout: /.gitignore
+          sparse-checkout-cone-mode: false
+
+      - name: Check default branch tip
+        id: tip
+        shell: bash
+        run: |
+          remote=$(git ls-remote --exit-code origin "$GITHUB_REF")
+          if [[ "${remote%%$'\t'*}" == "$GITHUB_SHA" ]]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "A newer commit is on $GITHUB_REF. Skipping this release run."
+          fi
+
+      - name: Set up release tooling
+        if: steps.tip.outputs.current == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Calculate version and release notes
+        if: steps.tip.outputs.current == 'true'
+        id: plan
+        shell: bash
+        env:
+          PUBLISH_GITHUB_RELEASE: ${{ inputs.github_release }}
+        run: |
+          cd "$(mktemp -d)"
+          npm install --no-save --ignore-scripts --no-audit --no-fund \
+            semantic-release@25.0.2 conventional-changelog-conventionalcommits@8.0.0
+
+          node --input-type=module <<'JS'
+          import { execFileSync } from 'node:child_process';
+          import { randomUUID } from 'node:crypto';
+          import { appendFileSync } from 'node:fs';
+          import { DEFAULT_COMMIT_TYPES } from 'conventional-changelog-conventionalcommits';
+          import semanticRelease from 'semantic-release';
+
+          const { GITHUB_OUTPUT, GITHUB_REF_NAME, GITHUB_REPOSITORY, GITHUB_SERVER_URL,
+                  GITHUB_SHA, GITHUB_WORKSPACE, PUBLISH_GITHUB_RELEASE } = process.env;
+          const preset = { preset: 'conventionalcommits', presetConfig: {} };
+          const plugins = [['@semantic-release/commit-analyzer', preset]];
+          if (PUBLISH_GITHUB_RELEASE === 'true') {
+            const types = DEFAULT_COMMIT_TYPES.map(type => ({ ...type, hidden: false }));
+            plugins.push(['@semantic-release/release-notes-generator', {
+              ...preset, presetConfig: { types },
+            }]);
+          }
+          const result = await semanticRelease({
+            branches: [GITHUB_REF_NAME],
+            repositoryUrl: `${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git`,
+            tagFormat: 'v${version}',
+            dryRun: true,
+            plugins,
+          }, { cwd: GITHUB_WORKSPACE });
+
+          const release = result?.nextRelease;
+          if (release) {
+            if (release.gitHead !== GITHUB_SHA) {
+              throw new Error('The release commit differs from the workflow commit.');
+            }
+            const existing = execFileSync('git', ['tag', '--list', release.gitTag],
+              { cwd: GITHUB_WORKSPACE, encoding: 'utf8' });
+            if (existing.trim()) throw new Error(`The planned tag ${release.gitTag} already exists.`);
+            const delimiter = randomUUID();
+            appendFileSync(GITHUB_OUTPUT, `version=${release.version}\ntag=${release.gitTag}\n` +
+              `notes<<${delimiter}\n${release.notes ?? ''}\n${delimiter}\n`);
+          }
+          JS
+
+  docker:
+    needs: plan
+    if: >-
+      needs.plan.outputs.version != '' && inputs.image != '' &&
+      needs.plan.outputs.run_attempt == github.run_attempt
+    uses: ./.github/workflows/docker-build-and-push.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      image: ${{ inputs.image }}
+      context: ${{ inputs.context }}
+      dockerfile: ${{ inputs.dockerfile }}
+      platforms: ${{ inputs.platforms }}
+      version: ${{ needs.plan.outputs.version }}
+      add_latest: ${{ inputs.add_latest }}
+      build_secret: ${{ inputs.build_secret }}
+    secrets:
+      registry_token: ${{ secrets.docker_registry_token || secrets.GITHUB_TOKEN }}
+
+  helm:
+    name: Publish versioned Helm chart
+    needs: plan
+    if: >-
+      needs.plan.outputs.version != '' && inputs.helm_chart_dir != '' &&
+      needs.plan.outputs.run_attempt == github.run_attempt
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.15.4
+
+      - name: Log in to the Helm OCI registry
+        shell: bash
+        env:
+          REGISTRY: ${{ inputs.helm_registry }}
+          REGISTRY_USERNAME: ${{ inputs.helm_registry_username || github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.helm_registry_token || (inputs.helm_registry == 'ghcr.io' && secrets.GITHUB_TOKEN) || '' }}
+        run: |
+          printf '%s\n' "$REGISTRY_TOKEN" | helm registry login \
+            "$REGISTRY" --username "$REGISTRY_USERNAME" --password-stdin
+
+      - name: Package and push chart
+        shell: bash
+        env:
+          CHART_DIR: ${{ inputs.helm_chart_dir }}
+          CHART_VERSION: ${{ needs.plan.outputs.version }}
+          REGISTRY: ${{ inputs.helm_registry }}
+          REPOSITORY: ${{ inputs.helm_repository }}
+        run: |
+          helm dependency build "$CHART_DIR"
+          helm lint "$CHART_DIR"
+
+          destination=$(mktemp -d)
+          helm package "$CHART_DIR" --version "$CHART_VERSION" --destination "$destination"
+
+          shopt -s nullglob
+          archives=("$destination"/*.tgz)
+          if [[ ${#archives[@]} != 1 ]]; then
+            echo '::error::Expected one packaged Helm chart.'
+            exit 1
+          fi
+          helm push "${archives[0]}" "oci://$REGISTRY/$REPOSITORY"
+
+  publish:
+    name: Finalize semantic release
+    needs: [plan, docker, helm]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.version != '' &&
+      (needs.plan.outputs.run_attempt != github.run_attempt ||
+       ((needs.docker.result == 'success' || (inputs.image == '' && needs.docker.result == 'skipped')) &&
+        (needs.helm.result == 'success' || (inputs.helm_chart_dir == '' && needs.helm.result == 'skipped'))))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.publish.outputs.version }}
+      tag: ${{ steps.publish.outputs.tag }}
+    steps:
+      - name: Create the Git tag and optional GitHub Release
+        id: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_ENTERPRISE_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_NOTES: ${{ needs.plan.outputs.notes }}
+          PUBLISH_GITHUB_RELEASE: ${{ inputs.github_release }}
+          PLAN_ATTEMPT: ${{ needs.plan.outputs.run_attempt }}
+        run: |
+          if [[ "$PLAN_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]; then
+            echo '::error::Re-run all jobs to calculate a fresh release version.'
+            exit 1
+          fi
+
+          host=${GITHUB_SERVER_URL#*://}
+          if [[ "$PUBLISH_GITHUB_RELEASE" == true ]]; then
+            gh release create "$RELEASE_TAG" --repo "$host/$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "$RELEASE_TAG" --notes-file - <<< "$RELEASE_NOTES"
+          else
+            gh api --hostname "$host" --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              --raw-field "ref=refs/tags/$RELEASE_TAG" --raw-field "sha=$GITHUB_SHA" --silent
+          fi
+          printf 'version=%s\ntag=%s\n' "$RELEASE_VERSION" "$RELEASE_TAG" >> "$GITHUB_OUTPUT"

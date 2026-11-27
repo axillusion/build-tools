@@ -1,0 +1,19 @@
+name: Release build-tools
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  push:
+    branches: [main]
+
+jobs:
+  release:
+    uses: ./.github/workflows/semantic-release.yml
+    permissions:
+      contents: write
+      # GitHub checks the permissions declared by the shared workflow's registry jobs.
+      packages: write
+    with:
+      github_release: true
+      # Last commit before this repository adopted Conventional Commits.
+      initial_validation_base: ccd4cc09a3b999600068fbfa90d5fa52a8008235
